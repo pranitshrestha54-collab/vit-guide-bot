@@ -563,12 +563,12 @@ const ChatPage = () => {
               {messages.map((message) => (
                 <div
                   key={message.id}
-                  className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                  className={`flex flex-col ${message.role === 'user' ? 'items-end' : 'items-start'}`}
                 >
                   <div
                     className={`max-w-[85%] ${
                       message.role === 'user' ? 'chat-bubble-user' : 'chat-bubble-bot'
-                    }`}
+                    } ${message.failed ? 'opacity-60 ring-1 ring-destructive' : ''}`}
                   >
                     {message.role === 'assistant' ? (
                       <div className="prose prose-sm max-w-none dark:prose-invert">
@@ -578,6 +578,21 @@ const ChatPage = () => {
                       <p>{message.content}</p>
                     )}
                   </div>
+                  {message.failed && message.role === 'user' && (
+                    <div className="flex items-center gap-2 mt-1 text-xs text-destructive">
+                      <span>Message failed to send</span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 px-2 text-xs text-destructive hover:text-destructive"
+                        onClick={() => handleRetry(message)}
+                        disabled={isLoading}
+                      >
+                        Retry
+                      </Button>
+                    </div>
+                  )}
                 </div>
               ))}
 
