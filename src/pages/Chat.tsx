@@ -43,7 +43,7 @@ const ChatPage = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const { user, fullName, userRole, isLoading: authLoading } = useAuth();
+  const { user, session, fullName, userRole, isLoading: authLoading } = useAuth();
   const { toast } = useToast();
   const navigate = useNavigate();
 
@@ -167,10 +167,16 @@ const ChatPage = () => {
     );
   };
 
-  const getFriendlyError = (status: number, fallback: string) => {
+  const getFriendlyError = (status: number, fallback: string, errorData?: { fallback?: boolean }) => {
+    if (errorData?.fallback) {
+      return 'The chat service is temporarily unavailable. Please try again in a moment.';
+    }
+
     switch (status) {
       case 401:
-        return 'Your session has expired. Please sign in again to continue.';
+        return /invalid authentication/i.test(fallback)
+          ? 'Your sign-in could not be verified. Please sign in again and retry your message.'
+          : 'Your session has expired. Please sign in again to continue.';
       case 403:
         return "You don't have permission to use the chat. Please contact support.";
       case 429:
@@ -190,19 +196,27 @@ const ChatPage = () => {
   };
 
   const callChatApi = async (apiMessages: { role: string; content: string }[], conversationId: string) => {
-    // Try to get a valid session, refreshing if needed
-    let { data: sessionData } = await supabase.auth.getSession();
-    let accessToken = sessionData.session?.access_token;
+    const resolveAccessToken = async () => {
+      if (session?.access_token) {
+        return session.access_token;
+      }
 
-    if (!accessToken) {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (sessionData.session?.access_token) {
+        return sessionData.session.access_token;
+      }
+
       const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession();
       if (refreshError || !refreshed.session?.access_token) {
         const err = new Error('Your session has expired. Please sign in again.');
         (err as Error & { status?: number }).status = 401;
         throw err;
       }
-      accessToken = refreshed.session.access_token;
-    }
+
+      return refreshed.session.access_token;
+    };
+
+    let accessToken = await resolveAccessToken();
 
     const doFetch = (token: string) =>
       fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`, {
@@ -221,7 +235,8 @@ const ChatPage = () => {
     if (response.status === 401) {
       const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession();
       if (!refreshError && refreshed.session?.access_token) {
-        response = await doFetch(refreshed.session.access_token);
+        accessToken = refreshed.session.access_token;
+        response = await doFetch(accessToken);
       }
     }
 
@@ -298,28 +313,42 @@ const ChatPage = () => {
         try {
           const errorData = await response.json();
           serverMessage = errorData?.error ?? '';
+          const friendly = getFriendlyError(response.status, serverMessage, errorData);
+
+          if (response.status === 401) {
+            toast({
+              variant: 'destructive',
+              title: 'Session expired',
+              description: friendly,
+            });
+            markUserFailed();
+            await supabase.auth.signOut();
+            navigate('/auth');
+            return;
+          }
+
+          const err = new Error(friendly);
+          (err as Error & { status?: number }).status = response.status;
+          throw err;
         } catch {
-          // ignore JSON parse errors
+          const friendly = getFriendlyError(response.status, serverMessage);
+
+          if (response.status === 401) {
+            toast({
+              variant: 'destructive',
+              title: 'Session expired',
+              description: friendly,
+            });
+            markUserFailed();
+            await supabase.auth.signOut();
+            navigate('/auth');
+            return;
+          }
+
+          const err = new Error(friendly);
+          (err as Error & { status?: number }).status = response.status;
+          throw err;
         }
-
-        const friendly = getFriendlyError(response.status, serverMessage);
-
-        if (response.status === 401) {
-          toast({
-            variant: 'destructive',
-            title: 'Session expired',
-            description: friendly,
-          });
-          markUserFailed();
-          // Sign out and redirect so they can log in again
-          await supabase.auth.signOut();
-          navigate('/auth');
-          return;
-        }
-
-        const err = new Error(friendly);
-        (err as Error & { status?: number }).status = response.status;
-        throw err;
       }
 
       // Handle streaming response
