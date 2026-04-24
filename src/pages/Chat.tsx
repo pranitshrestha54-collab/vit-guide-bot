@@ -166,7 +166,68 @@ const ChatPage = () => {
     );
   };
 
-  const sendMessage = async (messageText: string) => {
+  const getFriendlyError = (status: number, fallback: string) => {
+    switch (status) {
+      case 401:
+        return 'Your session has expired. Please sign in again to continue.';
+      case 403:
+        return "You don't have permission to use the chat. Please contact support.";
+      case 429:
+        return 'Too many requests. Please wait a moment and try again.';
+      case 402:
+        return 'The AI service is temporarily unavailable. Please try again later.';
+      case 400:
+        return fallback || 'Your message could not be processed. Please rephrase and try again.';
+      case 500:
+      case 502:
+      case 503:
+      case 504:
+        return 'The chat service is having trouble right now. Please try again in a moment.';
+      default:
+        return fallback || 'Something went wrong. Please try again.';
+    }
+  };
+
+  const callChatApi = async (apiMessages: { role: string; content: string }[], conversationId: string) => {
+    // Try to get a valid session, refreshing if needed
+    let { data: sessionData } = await supabase.auth.getSession();
+    let accessToken = sessionData.session?.access_token;
+
+    if (!accessToken) {
+      const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession();
+      if (refreshError || !refreshed.session?.access_token) {
+        const err = new Error('Your session has expired. Please sign in again.');
+        (err as Error & { status?: number }).status = 401;
+        throw err;
+      }
+      accessToken = refreshed.session.access_token;
+    }
+
+    const doFetch = (token: string) =>
+      fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ messages: apiMessages, conversationId }),
+      });
+
+    let response = await doFetch(accessToken);
+
+    // If unauthorized, try refreshing session once and retry
+    if (response.status === 401) {
+      const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession();
+      if (!refreshError && refreshed.session?.access_token) {
+        response = await doFetch(refreshed.session.access_token);
+      }
+    }
+
+    return response;
+  };
+
+  const sendMessage = async (messageText: string, retryOfMessageId?: string) => {
     if (!messageText.trim() || isLoading) return;
 
     setIsLoading(true);
@@ -181,58 +242,90 @@ const ChatPage = () => {
       }
     }
 
-    // Add user message
-    const userMessage: Message = {
-      id: crypto.randomUUID(),
-      role: 'user',
-      content: messageText,
-      created_at: new Date().toISOString(),
-    };
-    setMessages((prev) => [...prev, userMessage]);
-    setInput('');
+    // Add user message (or reuse the existing one if retrying)
+    let userMessage: Message;
+    if (retryOfMessageId) {
+      const existing = messages.find((m) => m.id === retryOfMessageId);
+      userMessage = existing ?? {
+        id: crypto.randomUUID(),
+        role: 'user',
+        content: messageText,
+        created_at: new Date().toISOString(),
+      };
+      // Clear previous failed flag
+      setMessages((prev) =>
+        prev.map((m) => (m.id === userMessage.id ? { ...m, failed: false } : m))
+      );
+    } else {
+      userMessage = {
+        id: crypto.randomUUID(),
+        role: 'user',
+        content: messageText,
+        created_at: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, userMessage]);
+      setInput('');
 
-    // Save user message
-    await saveMessage(conversationId, 'user', messageText);
+      // Save user message
+      await saveMessage(conversationId, 'user', messageText);
 
-    // Update title if first message
-    if (messages.length === 0) {
-      updateConversationTitle(conversationId, messageText);
+      // Update title if first message
+      if (messages.length === 0) {
+        updateConversationTitle(conversationId, messageText);
+      }
     }
 
-    // Prepare messages for API
-    const apiMessages = [...messages, userMessage].map((m) => ({
-      role: m.role,
-      content: m.content,
-    }));
+    // Prepare messages for API (exclude any prior failed assistant placeholders)
+    const baseMessages = retryOfMessageId
+      ? messages.filter((m) => !m.failed)
+      : [...messages, userMessage];
+    const apiMessages = baseMessages
+      .filter((m) => m.role === 'user' || (m.role === 'assistant' && m.content))
+      .map((m) => ({ role: m.role, content: m.content }));
+
+    const markUserFailed = () => {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === userMessage.id ? { ...m, failed: true } : m))
+      );
+    };
 
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      const accessToken = session?.access_token;
-
-      if (!accessToken) {
-        throw new Error('You must be logged in to chat. Please sign in again.');
-      }
-
-      const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          apikey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
-          Authorization: `Bearer ${accessToken}`,
-        },
-        body: JSON.stringify({ messages: apiMessages, conversationId }),
-      });
+      const response = await callChatApi(apiMessages, conversationId);
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to get response');
+        let serverMessage = '';
+        try {
+          const errorData = await response.json();
+          serverMessage = errorData?.error ?? '';
+        } catch {
+          // ignore JSON parse errors
+        }
+
+        const friendly = getFriendlyError(response.status, serverMessage);
+
+        if (response.status === 401) {
+          toast({
+            variant: 'destructive',
+            title: 'Session expired',
+            description: friendly,
+          });
+          markUserFailed();
+          // Sign out and redirect so they can log in again
+          await supabase.auth.signOut();
+          navigate('/auth');
+          return;
+        }
+
+        const err = new Error(friendly);
+        (err as Error & { status?: number }).status = response.status;
+        throw err;
       }
 
       // Handle streaming response
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
       let assistantContent = '';
-      let assistantMessageId = crypto.randomUUID();
+      const assistantMessageId = crypto.randomUUID();
 
       // Add empty assistant message
       setMessages((prev) => [
@@ -278,22 +371,39 @@ const ChatPage = () => {
         }
       }
 
-      // Save assistant message
       if (assistantContent) {
         await saveMessage(conversationId, 'assistant', assistantContent);
+      } else {
+        // Stream ended without any content
+        setMessages((prev) => prev.filter((m) => m.id !== assistantMessageId));
+        markUserFailed();
+        toast({
+          variant: 'destructive',
+          title: 'No response',
+          description: 'The assistant did not respond. Please try again.',
+        });
       }
     } catch (error) {
       console.error('Chat error:', error);
+      const description =
+        error instanceof Error ? error.message : 'Failed to get response. Please try again.';
       toast({
         variant: 'destructive',
-        title: 'Error',
-        description: error instanceof Error ? error.message : 'Failed to get response',
+        title: 'Chat error',
+        description,
       });
-      // Remove the empty assistant message on error
-      setMessages((prev) => prev.filter((m) => m.role !== 'assistant' || m.content !== ''));
+      // Remove any empty assistant placeholder and flag the user message as failed
+      setMessages((prev) =>
+        prev.filter((m) => !(m.role === 'assistant' && !m.content))
+      );
+      markUserFailed();
     }
 
     setIsLoading(false);
+  };
+
+  const handleRetry = (message: Message) => {
+    sendMessage(message.content, message.id);
   };
 
   const handleQuickReply = (prompt: string) => {
